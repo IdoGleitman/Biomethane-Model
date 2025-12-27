@@ -1,77 +1,85 @@
 import streamlit as st
 import pandas as pd
 import numpy_financial as npf
-import matplotlib.pyplot as plt
 
-# --- 1. CONFIGURATION ---
-st.set_page_config(page_title="Biomethane Pro-Forma", layout="wide")
+st.set_page_config(page_title="Custom Biogas Builder", layout="wide")
 
-db = {
-    "Cow Manure": {"yield": 45, "ch4": 0.55, "cost": -5.0}, 
-    "Food Waste": {"yield": 150, "ch4": 0.62, "cost": -25.0},
-    "Maize Silage": {"yield": 210, "ch4": 0.52, "cost": 45.0},
-    "Industrial Fats": {"yield": 450, "ch4": 0.70, "cost": -10.0}
-}
-
-# --- 2. UI: SIDEBAR ---
+# --- 1. SIDEBAR: GLOBAL SETTINGS ---
 with st.sidebar:
-    st.header("Global Project Settings")
-    gas_price = st.number_input("Biomethane Price ($/m3)", value=1.05)
-    co2_price = st.number_input("CO2 Price ($/ton)", value=50.0)
-    capex = st.number_input("Total CAPEX ($)", value=5000000, step=100000)
+    st.header("Project Financials")
+    capex = st.number_input("Total CAPEX ($)", value=5000000)
+    # NEW: Editable Base OPEX field
+    base_opex = st.number_input("Annual Fixed OPEX ($)", value=180000, help="Labor, Insurance, Maintenance")
+    variable_opex_rate = st.slider("Variable OPEX ($/m3 raw biogas)", 0.05, 0.25, 0.11)
     
-    st.header("Financing")
-    debt_pct = st.slider("Debt Fraction (%)", 0, 80, 60) / 100
-    interest_rate = st.slider("Interest Rate (%)", 3.0, 12.0, 7.0) / 100
-    loan_years = st.slider("Loan Term (Years)", 5, 20, 10)
+    st.header("Market Rates")
+    gas_price = st.number_input("Gas Sale Price ($/m3)", value=1.05)
+    co2_price = st.number_input("CO2 Sale Price ($/ton)", value=45.0)
 
-# --- 3. UI: MAIN PAGE ---
-st.title("🌱 Biomethane Investment Assessment Tool")
-st.subheader("Feedstock Configuration")
+# --- 2. MAIN UI: CUSTOM FEEDSTOCK BUILDER ---
+st.title("🚜 Custom Biomethane Plant Builder")
+st.write("Define your own feedstocks below. Set cost to **negative** for Gate Fees (Income).")
 
-cols = st.columns(4)
-active_data = []
+# We create 4 slots for custom feedstocks
+rows = []
+st.subheader("Feedstock Inventory")
+head1, head2, head3, head4, head5 = st.columns([2, 1, 1, 1, 1])
+head1.write("**Feedstock Name**")
+head2.write("**Tons/yr**")
+head3.write("**Yield (m3/t)**")
+head4.write("**CH4 %**")
+head5.write("**Cost ($/t)**")
 
-# Dynamic Feedstock Rows
-for i, name in enumerate(db.keys()):
-    with cols[i]:
-        enabled = st.checkbox(f"Use {name}", value=(i==0), key=f"en_{i}")
-        if enabled:
-            tons = st.number_input(f"Tons/yr", value=5000, key=f"t_{i}")
-            cost = st.number_input(f"Cost $/t", value=db[name]['cost'], key=f"c_{i}")
-            active_data.append({'tons': tons, 'cost': cost, 'yield': db[name]['yield'], 'ch4': db[name]['ch4']})
+# Create 4 rows of inputs
+for i in range(4):
+    c1, c2, c3, c4, c5 = st.columns([2, 1, 1, 1, 1])
+    name = c1.text_input(f"Name {i+1}", value=f"Feedstock {i+1}", key=f"n{i}")
+    tons = c2.number_input(f"Tons", value=0, key=f"t{i}")
+    yield_val = c3.number_input(f"Yield", value=100, key=f"y{i}")
+    methane = c4.slider(f"CH4%", 40, 75, 55, key=f"m{i}") / 100
+    cost = c5.number_input(f"Cost", value=0.0, key=f"c{i}")
+    
+    if tons > 0:
+        rows.append({'tons': tons, 'yield': yield_val, 'ch4': methane, 'cost': cost})
 
-# --- 4. CALCULATION ENGINE ---
-total_raw = sum(f['tons'] * f['yield'] for f in active_data)
-total_ch4 = sum(f['tons'] * f['yield'] * f['ch4'] for f in active_data) * 0.98
-total_co2 = (total_raw * 0.40) * 0.00198 * 0.90 
+# --- 3. UPDATED CALCULATION ENGINE ---
+total_raw_m3 = sum(r['tons'] * r['yield'] for r in rows)
+total_ch4_m3 = sum(r['tons'] * r['yield'] * r['ch4'] for r in rows) * 0.98
+total_co2_tons = (total_raw_m3 - (total_ch4_m3/0.98)) * 0.00198 * 0.90
 
-rev_gas = total_ch4 * gas_price
-rev_co2 = total_co2 * co2_price
-gate_fees = sum(abs(f['tons'] * f['cost']) for f in active_data if f['cost'] < 0)
-purchase_costs = sum(f['tons'] * f['cost'] for f in active_data if f['cost'] > 0)
+# P&L Breakdown
+rev_gas = total_ch4_m3 * gas_price
+rev_co2 = total_co2_tons * co2_price
 
-opex_base = 150000 + (total_raw * 0.12)
-ebitda = (rev_gas + rev_co2 + gate_fees) - (opex_base + purchase_costs)
+# Split Feedstock logic: Income (Gate Fees) vs Expense (Purchases)
+gate_fee_income = sum(abs(r['tons'] * r['cost']) for r in rows if r['cost'] < 0)
+feedstock_expense = sum(r['tons'] * r['cost'] for r in rows if r['cost'] > 0)
 
-loan_amount = capex * debt_pct
-annual_debt = npf.pmt(interest_rate, loan_years, -loan_amount) if loan_amount > 0 else 0
-cash_flow = ebitda - annual_debt
+# OPEX logic: Fixed (from slider) + Variable (based on gas volume)
+var_opex_total = total_raw_m3 * variable_opex_rate
+total_opex = base_opex + var_opex_total
 
-# --- 5. RESULTS ---
+ebitda = (rev_gas + rev_co2 + gate_fee_income) - (feedstock_expense + total_opex)
+
+# --- 4. THE CLEAN P&L VIEW ---
 st.divider()
-kpi1, kpi2, kpi3 = st.columns(3)
-kpi1.metric("Annual EBITDA", f"${ebitda:,.0f}")
-kpi2.metric("Project IRR", f"{npf.irr([-capex] + [ebitda]*15)*100:.2f}%")
-kpi3.metric("Net Cash Flow", f"${cash_flow:,.0f}")
+st.subheader("📊 Annual Profit & Loss (PnL)")
 
-st.write("### Annual Profit & Loss Statement")
-pnl = {
-    "Revenue: Gas & CO2": rev_gas + rev_co2,
-    "Revenue: Gate Fees": gate_fees,
-    "Expenses: Feedstock & OPEX": -(purchase_costs + opex_base),
-    "**EBITDA**": ebitda,
-    "Debt Service": -annual_debt,
-    "**Pre-Tax Cash Flow**": cash_flow
+pnl_data = {
+    "Revenue Streams": ["Biomethane Sales", "CO2 Sales", "Gate Fee Income", "**Gross Revenue**"],
+    "Value ($)": [rev_gas, rev_co2, gate_fee_income, (rev_gas + rev_co2 + gate_fee_income)],
+    "Operating Expenses": ["Feedstock Purchases", "Fixed Plant OPEX", "Variable OPEX (Power/Maint)", "**Total Expenses**"],
+    "Cost ($)": [-feedstock_expense, -base_opex, -var_opex_total, -(feedstock_expense + total_opex)]
 }
-st.table(pd.Series(pnl, name="Amount ($)"))
+
+# Displaying as two clean columns
+col_rev, col_exp = st.columns(2)
+with col_rev:
+    df_rev = pd.DataFrame({"Item": pnl_data["Revenue Streams"], "Amount": pnl_data["Value ($)"]})
+    st.dataframe(df_rev.style.format({"Amount": "${:,.0f}"}), use_container_width=True, hide_index=True)
+
+with col_exp:
+    df_exp = pd.DataFrame({"Item": pnl_data["Operating Expenses"], "Amount": pnl_data["Cost ($)"]})
+    st.dataframe(df_exp.style.format({"Amount": "${:,.0f}"}), use_container_width=True, hide_index=True)
+
+st.metric("FINAL ANNUAL EBITDA", f"${ebitda:,.0f}", delta=f"{ (ebitda/capex)*100:.1f}% Yield on CAPEX")
