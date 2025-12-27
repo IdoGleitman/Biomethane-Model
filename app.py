@@ -1,13 +1,13 @@
 import streamlit as st
 import pandas as pd
 import numpy_financial as npf
+import plotly.graph_objects as go # NEW: Using Plotly for better interactive charts
 
 st.set_page_config(page_title="Biogas Investment Master", layout="wide")
 
 # --- 1. SIDEBAR: PROJECT OVERHEAD ---
 with st.sidebar:
     st.header("🏢 Acquisition & Construction")
-    # NEW: Purchase Price vs CAPEX
     purchase_price = st.number_input("Plant Purchase Price ($)", value=2000000, step=100000)
     construction_capex = st.number_input("Retrofit/Construction CAPEX ($)", value=3000000, step=100000)
     total_investment = purchase_price + construction_capex
@@ -44,55 +44,119 @@ for i in range(4):
         rows.append({'tons': tons, 'yield': y_val, 'ch4': m_pct, 'cost': f_cost})
 
 # --- 3. CORE CALCULATION ENGINE ---
-def calculate_ebitda(g_p, f_o, c_o, f_p_adj):
+def calculate_ebitda(g_p_adj, f_o_adj, v_o_r_adj, f_p_adj, total_inv_adj):
     """Calculates EBITDA based on adjusted inputs for sensitivity"""
     t_raw = sum(r['tons'] * r['yield'] for r in rows)
     t_ch4 = sum(r['tons'] * r['yield'] * r['ch4'] for r in rows) * 0.98
     t_co2 = (t_raw - (t_ch4/0.98)) * 0.00198 * 0.90
     
-    rev = (t_ch4 * g_p) + (t_co2 * co2_price)
+    rev = (t_ch4 * g_p_adj) + (t_co2 * co2_price) # CO2 price is not sensitive in this function
     
-    # Apply feedstock price adjustment for sensitivity
     f_costs_actual = sum(r['tons'] * (r['cost'] * f_p_adj) for r in rows)
-    # Split into income vs expense
     g_fees = abs(f_costs_actual) if f_costs_actual < 0 else 0
     p_costs = f_costs_actual if f_costs_actual > 0 else 0
     
-    total_op = f_o + (t_raw * var_opex_rate)
+    total_op = f_o_adj + (t_raw * v_o_r_adj) # Use adjusted fixed and var opex rate
     return (rev + g_fees) - (p_costs + total_op)
 
-base_ebitda = calculate_ebitda(gas_price, fixed_opex, var_opex_rate, 1.0)
+# Base Case for Calculations
+base_ebitda = calculate_ebitda(gas_price, fixed_opex, var_opex_rate, 1.0, total_investment)
 
 # --- 4. SENSITIVITY ANALYSIS ---
 st.divider()
 st.subheader("2. Sensitivity Analysis (EBITDA Impact)")
 
-sens_range = [-0.20, -0.10, 0, 0.10, 0.20]
+sens_range_pct = [-0.20, -0.10, 0, 0.10, 0.20]
 sens_data = []
 
-for pct in sens_range:
+for pct in sens_range_pct:
     label = f"{pct*100:+.0f}%"
     sens_data.append({
         "Change": label,
-        "Gas Price": calculate_ebitda(gas_price*(1+pct), fixed_opex, var_opex_rate, 1.0),
-        "Fixed OPEX": calculate_ebitda(gas_price, fixed_opex*(1+pct), var_opex_rate, 1.0),
-        "Feedstock Cost": calculate_ebitda(gas_price, fixed_opex, var_opex_rate, (1+pct)),
-        "CAPEX (IRR Impact)": total_investment * (1+pct)
+        "Gas Price": calculate_ebitda(gas_price*(1+pct), fixed_opex, var_opex_rate, 1.0, total_investment),
+        "Fixed OPEX": calculate_ebitda(gas_price, fixed_opex*(1+pct), var_opex_rate, 1.0, total_investment),
+        "Var OPEX Rate": calculate_ebitda(gas_price, fixed_opex, var_opex_rate*(1+pct), 1.0, total_investment),
+        "Feedstock Cost": calculate_ebitda(gas_price, fixed_opex, var_opex_rate, (1+pct), total_investment),
+        "Total Investment (IRR Impact)": total_investment * (1+pct) # This impacts IRR, not directly EBITDA
     })
 
 df_sens = pd.DataFrame(sens_data).set_index("Change")
 st.table(df_sens.style.format("${:,.0f}"))
 
-# --- 5. FINAL METRICS ---
+
+# --- 5. TORNADO CHART ---
+st.subheader("3. Tornado Chart: Key Impact Factors on EBITDA")
+
+# Calculate min/max EBITDA for each variable for the Tornado Chart
+tornado_data = {}
+# Base case (0% change) for comparison
+base_ebitda_val = df_sens.loc['+0%']['Gas Price'] # All 0% values should be the same
+for col in ['Gas Price', 'Fixed OPEX', 'Var OPEX Rate', 'Feedstock Cost']:
+    ebitda_minus_20 = df_sens.loc['-20%'][col]
+    ebitda_plus_20 = df_sens.loc['+20%'][col]
+    impact_range = ebitda_plus_20 - ebitda_minus_20
+    
+    tornado_data[col] = {
+        'min_ebitda': ebitda_minus_20,
+        'max_ebitda': ebitda_plus_20,
+        'impact_range': impact_range
+    }
+
+# Sort by impact range (descending)
+sorted_tornado = sorted(tornado_data.items(), key=lambda item: item[1]['impact_range'], reverse=True)
+
+labels = [item[0] for item in sorted_tornado]
+# For the plot, we want the deviation from the base case
+low_values = [base_ebitda_val - item[1]['min_ebitda'] for item in sorted_tornado]
+high_values = [item[1]['max_ebitda'] - base_ebitda_val for item in sorted_tornado]
+
+fig = go.Figure()
+
+for i in range(len(labels)):
+    fig.add_trace(go.Bar(
+        y=[labels[i]],
+        x=[-low_values[i]], # Negative for left side of chart (lower EBITDA)
+        name=f'-20% {labels[i]}',
+        orientation='h',
+        marker_color='red'
+    ))
+    fig.add_trace(go.Bar(
+        y=[labels[i]],
+        x=[high_values[i]], # Positive for right side of chart (higher EBITDA)
+        name=f'+20% {labels[i]}',
+        orientation='h',
+        marker_color='green'
+    ))
+
+fig.update_layout(
+    barmode='relative',
+    title='Tornado Chart: EBITDA Sensitivity (+/-20% Change)',
+    xaxis_title='EBITDA Deviation from Base Case ($)',
+    yaxis_title='Parameter',
+    yaxis={'categoryorder':'total ascending'}, # Keep the largest impact at the top
+    showlegend=False,
+    height=400
+)
+
+st.plotly_chart(fig, use_container_width=True)
+
+
+# --- 6. FINAL METRICS ---
 st.divider()
 col_pnl, col_met = st.columns([2, 1])
 
 with col_pnl:
-    st.write("### Project Summary")
-    st.write(f"**Annual EBITDA (Base Case):** ${base_ebitda:,.0f}")
+    st.write("### Project Summary (Base Case)")
+    st.write(f"**Annual EBITDA:** ${base_ebitda:,.0f}")
     st.write(f"**Total Capital Outlay:** ${total_investment:,.0f}")
 
 with col_met:
-    irr = npf.irr([-total_investment] + [base_ebitda] * 15)
-    st.metric("Project IRR (15 yr)", f"{irr*100:.2f}%" if irr else "N/A")
+    # Need to handle potential for non-real IRR (e.g., all negative cash flows)
+    irr = None
+    try:
+        irr = npf.irr([-total_investment] + [base_ebitda] * 15)
+    except ValueError:
+        pass # IRR calculation can fail if cash flows don't cross zero
+
+    st.metric("Project IRR (15 yr)", f"{irr*100:.2f}%" if irr is not None else "N/A")
     st.metric("Simple Payback", f"{total_investment/base_ebitda:.1f} years" if base_ebitda > 0 else "N/A")
